@@ -223,8 +223,9 @@ class AttentionBackend(ABC):
         requests, so the total draft budget, the decode/prefill split point and the CPU
         prefill query lengths all stay correct.
 
-        SSM backends opt out: their recurrent-state planning is built from the CPU
-        per-request boundaries, which the trimmed batch no longer matches.
+        SSM backends opt out by default: recurrent-state planning built from the CPU
+        per-request boundaries would not match the trimmed batch. Those that plan
+        their verification rows from the device offsets (e.g. GDN) opt back in.
         """
         return not cls.is_ssm()
 

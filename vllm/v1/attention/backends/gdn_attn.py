@@ -27,7 +27,7 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 # FlashInfer's GDN prefill emits states every N tokens, N a multiple of its
 # 64-token chunk, so checkpoint offsets must be multiples of 64.
@@ -84,6 +84,15 @@ class GDNAttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # The convolution, the recurrence and the per-position state writes of
+        # spec-decode rows all read the device query_start_loc. The host
+        # lengths only give the token totals, the spec/non-spec split (taken
+        # from request state, not lengths) and the non-spec lengths, all of
+        # which stay exact when verification rows are trimmed on device.
+        return True
+
 
 @dataclass
 class GDNAttentionMetadata:
@@ -114,7 +123,8 @@ class GDNAttentionMetadata:
     non_spec_token_indx: torch.Tensor | None = None
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
-    uniform_spec_sequence_length: int | None = None  # None for ragged batches
+    # None for ragged batches and whenever device lengths may differ from host
+    uniform_spec_sequence_length: int | None = None
 
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
@@ -136,6 +146,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
+    ) -> int | None:
+        # Decode graphs run the spec-decode kernels, which take each request's
+        # rows from the device query_start_loc and write one state per row to
+        # its num_spec + 1 state slots. Mixed prefill/decode graphs keep
+        # UNIFORM_BATCH's restrictions.
+        return vllm_config.num_speculative_tokens + 1
 
     def __init__(
         self,
@@ -175,6 +195,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
+        # Adaptive verification splits the draft budget evenly on the host and
+        # trims verification rows on device, so equal host lengths do not mean
+        # equal device lengths.
+        self.host_spec_query_lens_exact = not getattr(
+            self.speculative_config, "enable_adaptive_verification", False
+        )
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -398,7 +424,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_sequence_masks_cpu = ~spec_sequence_masks_cpu
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             spec_query_lens_cpu = query_lens_cpu[spec_sequence_masks_cpu]
-            if spec_query_lens_cpu.numel() > 0:
+            if spec_query_lens_cpu.numel() > 0 and self.host_spec_query_lens_exact:
                 first_spec_sequence_length = int(spec_query_lens_cpu[0])
                 if first_spec_sequence_length > 0 and bool(
                     torch.all(spec_query_lens_cpu == first_spec_sequence_length)
