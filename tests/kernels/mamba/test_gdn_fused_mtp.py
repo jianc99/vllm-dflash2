@@ -28,6 +28,7 @@ from tests.v1.attention.utils import (  # noqa: E402
     create_vllm_config,
 )
 from vllm.config import SpeculativeConfig, set_current_vllm_config  # noqa: E402
+from vllm.config.compilation import CUDAGraphMode  # noqa: E402
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn  # noqa: E402
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa: E402
     ChunkGatedDeltaRule,
@@ -393,3 +394,181 @@ def test_fused_model_path_matches_reference(
         atol=3e-2,
         rtol=3e-2,
     )
+
+
+def _even_split(query_lens: list[int]) -> list[int]:
+    """The host lengths of rows trimmed by adaptive verification: the same
+    draft budget split evenly over the verification rows."""
+    num_rows = sum(n > 0 for n in query_lens)
+    budget = sum(query_lens) - num_rows
+    split = [
+        1 + budget // num_rows + (row < budget % num_rows) for row in range(num_rows)
+    ]
+    return split + [0] * (len(query_lens) - num_rows)
+
+
+@pytest.mark.parametrize("gdn_decode_kernel", ["triton", "cuda"])
+@torch.inference_mode()
+def test_varlen_graph_replays_trimmed_verification(gdn_decode_kernel: str) -> None:
+    """Adaptive verification replays one decode graph with rows trimmed on
+    device: outputs and per-row states match an eager run on exact lengths."""
+    if gdn_decode_kernel == "cuda" and not hasattr(
+        torch.ops._C, "fused_gdn_decode_post_conv_mtp"
+    ):
+        pytest.skip("fused GDN decode MTP op is not built")
+    torch.manual_seed(2)
+    device = torch.device("cuda")
+    num_reqs = 4
+    num_tokens = num_reqs * SPEC_TOKENS
+
+    def make_builder(adaptive: bool) -> GDNAttentionMetadataBuilder:
+        vllm_config = _make_vllm_config()
+        vllm_config.compilation_config.cudagraph_mode = (
+            CUDAGraphMode.FULL_AND_PIECEWISE if adaptive else CUDAGraphMode.NONE
+        )
+        vllm_config.speculative_config = SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=NUM_SPEC,
+            enable_adaptive_verification=adaptive,
+        )
+        return GDNAttentionMetadataBuilder(
+            kv_cache_spec=MambaSpec(
+                block_size=BLOCK_SIZE,
+                shapes=((16, 64),),
+                dtypes=(torch.float16,),
+                num_speculative_blocks=NUM_SPEC,
+            ),
+            layer_names=[PREFIX],
+            vllm_config=vllm_config,
+            device=device,
+        )
+
+    def make_batch(query_lens, host_query_lens, num_actual_tokens):
+        common = create_common_attn_metadata(
+            BatchSpec(
+                seq_lens=[BLOCK_SIZE * SPEC_TOKENS] * num_reqs, query_lens=query_lens
+            ),
+            BLOCK_SIZE,
+            device,
+            arange_block_indices=True,
+        )
+        common.block_table_tensor.add_(1)
+        host_query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32)
+        host_query_start_loc[1:] = torch.tensor(host_query_lens).cumsum(0)
+        return common.replace(
+            query_start_loc_cpu=host_query_start_loc,
+            num_actual_tokens=num_actual_tokens,
+        )
+
+    graph_builder, eager_builder = make_builder(True), make_builder(False)
+    conv_state_shape, temporal_state_shape = (
+        MambaStateShapeCalculator.gated_delta_net_state_shape(
+            1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
+        )
+    )
+    pool_size = num_reqs * SPEC_TOKENS + 1
+    conv_state_seed = 0.05 * torch.randn(
+        pool_size, *conv_state_shape, dtype=torch.bfloat16, device=device
+    )
+    ssm_state_seed = 0.01 * torch.randn(
+        pool_size, *temporal_state_shape, dtype=torch.float32, device=device
+    )
+    a_log = 0.1 * torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = 0.1 * torch.randn(HV, dtype=torch.float32, device=device)
+    conv_weight = 0.1 * torch.randn(
+        CONV_DIM, 1, CONV_KERNEL, dtype=torch.bfloat16, device=device
+    )
+    norm_weight = torch.randn(V, dtype=torch.float32, device=device)
+    mixed_qkv = torch.zeros(num_tokens, CONV_DIM, dtype=torch.bfloat16, device=device)
+    b = torch.zeros(num_tokens, HV, dtype=torch.bfloat16, device=device)
+    a = torch.zeros_like(b)
+    output_gate = torch.zeros(num_tokens, HV, V, dtype=torch.bfloat16, device=device)
+    out = torch.zeros_like(output_gate)
+
+    def make_layer(conv_state, ssm_state):
+        layer = _build_layer(
+            _make_vllm_config(),
+            conv_state,
+            ssm_state,
+            a_log,
+            dt_bias,
+            conv_weight,
+            norm_weight,
+            "silu",
+        )
+        layer.gdn_decode_kernel = gdn_decode_kernel
+        return layer
+
+    def run(layer, metadata, qkv, b_, a_, gate, output):
+        context = types.SimpleNamespace(attn_metadata={PREFIX: metadata})
+        with patch.object(
+            qwen_gdn_linear_attn, "get_forward_context", return_value=context
+        ):
+            layer._forward_core_fused_norm(
+                mixed_qkv=qkv, b=b_, a=a_, output_gate=gate, core_attn_out=output
+            )
+
+    conv_state, ssm_state = conv_state_seed.clone(), ssm_state_seed.clone()
+    layer = make_layer(conv_state, ssm_state)
+    full_width = [SPEC_TOKENS] * num_reqs
+    captured = graph_builder.build_for_cudagraph_capture(
+        make_batch(full_width, full_width, num_tokens)
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(layer, captured, mixed_qkv, b, a, output_gate, out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run(layer, captured, mixed_qkv, b, a, output_gate, out)
+
+    for query_lens in (
+        [1, 4, 4, 3],
+        [4, 1, 2, 4],
+        [1, 1, 1, 1],
+        [4, 4, 1, 0],
+        [2, 0, 0, 0],
+    ):
+        num_rows = sum(n > 0 for n in query_lens)
+        total = sum(query_lens)
+        accepted = torch.randint(
+            1, SPEC_TOKENS + 1, (num_reqs,), dtype=torch.int32, device=device
+        )
+        draft_tokens = torch.tensor(
+            [NUM_SPEC] * num_rows + [-1] * (num_reqs - num_rows), dtype=torch.int32
+        )
+        graph_builder.build(
+            0,
+            make_batch(query_lens, _even_split(query_lens), num_tokens),
+            num_accepted_tokens=accepted,
+            num_decode_draft_tokens_cpu=draft_tokens,
+        )
+        for tensor in (mixed_qkv, b, a, output_gate):
+            tensor.copy_(0.1 * torch.randn_like(tensor))
+        # The convolution overwrites its input in place, so the eager reference
+        # takes a copy made before the replay.
+        qkv_in, b_in, a_in, gate_in = (
+            x[:total].clone() for x in (mixed_qkv, b, a, output_gate)
+        )
+        conv_state.copy_(conv_state_seed)
+        ssm_state.copy_(ssm_state_seed)
+        graph.replay()
+
+        reference = make_layer(conv_state_seed.clone(), ssm_state_seed.clone())
+        reference_out = torch.zeros(total, HV, V, dtype=torch.bfloat16, device=device)
+        reference_metadata = eager_builder.build(
+            0,
+            make_batch(query_lens, query_lens, total),
+            num_accepted_tokens=accepted,
+            num_decode_draft_tokens_cpu=draft_tokens,
+        )
+        run(reference, reference_metadata, qkv_in, b_in, a_in, gate_in, reference_out)
+
+        torch.testing.assert_close(out[:total], reference_out, atol=1e-2, rtol=1e-2)
+        # Every state slot, including the rows past each trimmed length that
+        # neither run may write.
+        torch.testing.assert_close(conv_state, reference.kv_cache[0], atol=0, rtol=0)
+        torch.testing.assert_close(
+            ssm_state, reference.kv_cache[1], atol=1e-4, rtol=1e-4
+        )

@@ -3,12 +3,17 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionBackend,
+    GDNAttentionMetadataBuilder,
+)
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -159,6 +164,39 @@ def test_manager_checks_target_varlen_cudagraph_bound(
             vllm_config=None,
             target_layer_names={"target"},
             additional_attn_cg_support=additional,
+        )
+        assert manager is created
+
+
+@pytest.mark.parametrize("num_speculative_steps,error", [(7, None), (8, "at most 8")])
+def test_manager_accepts_gdn_target(monkeypatch, num_speculative_steps, error):
+    """GDN hybrid targets pass both checks for their own verification width."""
+    builder = GDNAttentionMetadataBuilder.__new__(GDNAttentionMetadataBuilder)
+    group: Any = SimpleNamespace(
+        layer_names=["linear_attn"],
+        backend=GDNAttentionBackend,
+        kv_cache_spec=None,
+        get_metadata_builder=lambda _index: builder,
+    )
+    created = object()
+    monkeypatch.setattr(
+        adaptive_module,
+        "AdaptiveVerificationManager",
+        lambda *_args, **_kwargs: created,
+    )
+
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        manager = maybe_create_adaptive_verification_manager(
+            enable_adaptive_verification=True,
+            attn_groups=[[group]],
+            # The runner verifies num_speculative_steps + 1 tokens per request.
+            req_states=SimpleNamespace(num_speculative_steps=num_speculative_steps),
+            query_start_loc=object(),
+            num_bonus_tokens=1,
+            max_total_logits=1,
+            # The GDN state slots are sized for 7 drafts.
+            vllm_config=SimpleNamespace(num_speculative_tokens=7),
+            target_layer_names={"linear_attn"},
         )
         assert manager is created
 

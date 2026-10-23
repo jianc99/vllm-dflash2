@@ -19,11 +19,15 @@ from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionBackend,
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
     plan_flashinfer_checkpoints,
 )
-from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
+    mamba_get_block_table_tensor,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -150,6 +154,7 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    adaptive_verification: bool = False,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -163,6 +168,7 @@ def _create_gdn_builder(
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
+            enable_adaptive_verification=adaptive_verification,
         )
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
@@ -300,6 +306,164 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def _trimmed_verify_batch(
+    seq_lens: list[int], device_query_lens: list[int], host_query_lens: list[int]
+) -> tuple[CommonAttentionMetadata, CommonAttentionMetadata]:
+    """A batch as adaptive verification hands it over, where the host splits
+    the draft budget evenly while the device holds the trimmed lengths (same
+    total), and the same batch with exact host lengths."""
+    assert sum(host_query_lens) == sum(device_query_lens)
+    exact = create_common_attn_metadata(
+        BatchSpec(seq_lens=seq_lens, query_lens=device_query_lens),
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    )
+    exact = exact.replace(block_table_tensor=exact.block_table_tensor + 1)
+    host_query_start_loc = torch.zeros(len(host_query_lens) + 1, dtype=torch.int32)
+    host_query_start_loc[1:] = torch.tensor(host_query_lens).cumsum(0)
+    return exact.replace(query_start_loc_cpu=host_query_start_loc), exact
+
+
+_DEVICE_PLAN_FIELDS = (
+    "num_prefills",
+    "num_prefill_tokens",
+    "num_decodes",
+    "num_decode_tokens",
+    "num_spec_decodes",
+    "num_spec_decode_tokens",
+    "spec_query_start_loc",
+    "spec_state_indices_tensor",
+    "spec_token_indx",
+    "non_spec_query_start_loc",
+    "non_spec_state_indices_tensor",
+    "non_spec_token_indx",
+    "num_accepted_tokens",
+    "prefill_query_start_loc",
+    "prefill_state_indices",
+    "prefill_has_initial_state",
+)
+
+
+def test_adaptive_verification_capabilities():
+    """GDN takes trimmed verification rows from the device and its decode
+    graphs replay any row length up to the verification width."""
+    assert GDNAttentionBackend.supports_device_cpu_query_lens_mismatch()
+    builder = _create_gdn_builder(3, adaptive_verification=True)
+    bound = GDNAttentionMetadataBuilder.get_varlen_cudagraph_max_query_len
+    assert bound(builder.vllm_config, builder.kv_cache_spec) == 4
+    no_spec = _create_gdn_builder()
+    assert bound(no_spec.vllm_config, no_spec.kv_cache_spec) == 1
+
+
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+@pytest.mark.parametrize("full_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    "seq_lens,device_query_lens,host_query_lens,draft_tokens",
+    [
+        pytest.param([64, 64, 64], [1, 4, 4], [3, 3, 3], [3, 3, 3], id="spec-decode"),
+        pytest.param(
+            [64, 64, 64, 64],
+            [4, 1, 1, 0],
+            [2, 2, 2, 0],
+            [3, 3, 3, -1],
+            id="spec-decode-padded",
+        ),
+        pytest.param(
+            [64, 64, 100], [1, 4, 6], [3, 2, 6], [3, 3, -1], id="spec-and-prefill"
+        ),
+    ],
+)
+def test_adaptive_verification_plans_from_device_offsets(
+    mamba_cache_mode: str,
+    full_cuda_graph: bool,
+    seq_lens: list[int],
+    device_query_lens: list[int],
+    host_query_lens: list[int],
+    draft_tokens: list[int],
+):
+    """With an even host split of the draft budget, the plan equals the plan of
+    the same batch with exact host lengths."""
+    trimmed, exact = _trimmed_verify_batch(seq_lens, device_query_lens, host_query_lens)
+    kwargs = dict(
+        num_accepted_tokens=torch.arange(len(seq_lens), dtype=torch.int32) % 4 + 1,
+        num_decode_draft_tokens_cpu=torch.tensor(draft_tokens, dtype=torch.int32),
+    )
+    builder = _create_gdn_builder(3, full_cuda_graph, adaptive_verification=True)
+    exact_builder = _create_gdn_builder(3, full_cuda_graph)
+    for b in (builder, exact_builder):
+        b.vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    meta = builder.build(0, trimmed, **kwargs)
+    expected = exact_builder.build(0, exact, **kwargs)
+
+    assert meta.num_spec_decodes > 0
+    assert meta.uniform_spec_sequence_length is None
+    for field in _DEVICE_PLAN_FIELDS:
+        actual, wanted = getattr(meta, field), getattr(expected, field)
+        if isinstance(wanted, torch.Tensor):
+            torch.testing.assert_close(actual, wanted, msg=field)
+        else:
+            assert actual == wanted, field
+
+
+@pytest.mark.parametrize("adaptive_verification", [False, True])
+def test_uniform_spec_length_needs_exact_host_lengths(adaptive_verification: bool):
+    """Equal host lengths only mean equal device lengths without adaptive
+    verification, which may have trimmed the rows on device."""
+    builder = _create_gdn_builder(3, adaptive_verification=adaptive_verification)
+    batch = BatchSpec(seq_lens=[64, 64], query_lens=[3, 3])
+    meta = _build(builder, batch, num_decode_draft_tokens=[3, 3])
+
+    assert meta.uniform_spec_sequence_length == (None if adaptive_verification else 3)
+
+
+def test_adaptive_verification_replays_into_captured_buffers():
+    """A varlen decode graph is captured once (one token per request slot) and
+    replayed with trimmed rows; the replay's metadata must land in the buffers
+    the captured kernels read."""
+    builder = _create_gdn_builder(3, full_cuda_graph=True, adaptive_verification=True)
+    exact_builder = _create_gdn_builder(3)
+    for b in (builder, exact_builder):
+        b.vllm_config.cache_config.mamba_cache_mode = "none"
+    capture = create_common_attn_metadata(
+        BatchSpec(seq_lens=[64] * 8, query_lens=[1] * 8),
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    )
+    captured = builder.build_for_cudagraph_capture(capture)
+    # The captured kernels cover every request slot of the graph.
+    assert captured.num_spec_decodes == 8
+
+    trimmed, exact = _trimmed_verify_batch(
+        seq_lens=[64] * 3 + [0] * 5,
+        device_query_lens=[1, 4, 3] + [0] * 5,
+        host_query_lens=[3, 3, 2] + [0] * 5,
+    )
+    kwargs = dict(
+        num_accepted_tokens=torch.tensor([1, 2, 3] + [1] * 5, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([3] * 3 + [-1] * 5, dtype=torch.int32),
+    )
+    meta = builder.build(0, trimmed, **kwargs)
+    expected = exact_builder.build(0, exact, **kwargs)
+
+    fields = (
+        "spec_query_start_loc",
+        "spec_state_indices_tensor",
+        "num_accepted_tokens",
+    )
+    for field in fields:
+        assert getattr(meta, field).data_ptr() == getattr(captured, field).data_ptr()
+    # What the captured kernels read when the graph replays: the real rows,
+    # then empty padding rows without state.
+    assert captured.spec_query_start_loc.tolist() == [0, 1, 5, 8, 8, 8, 8, 8, 8]
+    torch.testing.assert_close(
+        captured.spec_state_indices_tensor[:3], expected.spec_state_indices_tensor
+    )
+    assert (captured.spec_state_indices_tensor[3:] == NULL_BLOCK_ID).all()
+    assert captured.num_accepted_tokens.tolist() == [1, 2, 3] + [1] * 5
 
 
 def _build_non_spec(
@@ -441,8 +605,6 @@ def test_checkpoint_metadata_preserves_non_spec_order(
     num_spec, prefix_match_unit, expected_offset
 ):
     """Only eligible non-spec rows get a checkpoint in their reserved page."""
-    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
     builder, common, kwargs = _create_checkpoint_builder_and_batch(
         num_spec, prefix_match_unit
     )

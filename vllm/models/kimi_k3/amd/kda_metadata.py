@@ -128,11 +128,6 @@ class KimiK3ROCmKDAMetadataBuilder(GDNAttentionMetadataBuilder):
             num_decode_draft_tokens_cpu,
             fast_build,
         )
-        if (
-            attn_metadata.uniform_spec_sequence_length is not None
-            and _adaptive_verification_enabled(self.vllm_config)
-        ):
-            attn_metadata = replace(attn_metadata, uniform_spec_sequence_length=None)
         if attn_metadata.checkpoint is None:
             return attn_metadata
         # The shared builder keys checkpoint rows on every request; the ROCm
