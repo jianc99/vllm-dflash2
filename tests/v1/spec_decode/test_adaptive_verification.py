@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
@@ -306,3 +307,48 @@ def test_zero_budget_rebuilds_cpu_cu_num_logits():
     assert cu_num_logits_np.dtype == scheduled_cu_num_logits.dtype
     # The prefill keeps its scheduled tokens; only drafts are dropped.
     assert np.array_equal(compacted, np.array([1, 1, 40], dtype=np.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_record_confidences_follows_tp_rank_zero(monkeypatch):
+    # Tensor-parallel ranks compute their confidences independently and can
+    # disagree in the last bits. Every rank must budget and trim from rank 0's
+    # values, or the ranks run different token counts and their collectives hang.
+    device = torch.device("cuda")
+    rank_zero = torch.tensor(
+        [[0.9, 0.8, 0.7], [0.6, 0.5, 0.4]], dtype=torch.float32, device=device
+    )
+    broadcast_sources = []
+
+    def broadcast(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+        broadcast_sources.append(src)
+        return tensor.copy_(rank_zero)
+
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(broadcast=broadcast),
+    )
+    req_states = SimpleNamespace(device=device, num_speculative_steps=3, max_num_reqs=4)
+    manager = AdaptiveVerificationManager(
+        req_states,  # type: ignore[arg-type]
+        torch.zeros(5, dtype=torch.int32, device=device),
+        num_bonus_tokens=1,
+        max_total_logits=64,
+    )
+    local = torch.full((4, 3), 0.25, dtype=torch.float32, device=device)
+    idx_mapping = torch.tensor([2, 0], dtype=torch.int32, device=device)
+    write_idx = manager._stale_idx
+
+    manager.record_confidences(
+        local,
+        SimpleNamespace(num_reqs=2, idx_mapping=idx_mapping),  # type: ignore[arg-type]
+    )
+    torch.accelerator.synchronize()
+
+    assert broadcast_sources == [0]
+    slots = idx_mapping.long()
+    assert torch.equal(manager._confidence_probs[slots], rank_zero)
+    # The CPU copy that later budgets read carries rank 0's values too.
+    stale = manager._stale_confidences[write_idx].np[slots.cpu().numpy()]
+    assert np.array_equal(stale, rank_zero.cpu().numpy())
