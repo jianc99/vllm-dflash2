@@ -269,7 +269,14 @@ class AdaptiveVerificationManager:
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
 
-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
+        confidences = confidence_probs[:num_reqs]
+        # Each tensor-parallel rank estimates acceptance from its own copy of
+        # the draft activations, so the estimates differ across ranks. The
+        # budget and the per-request trim must be identical on every rank, or
+        # the ranks run different token counts and their collectives hang, so
+        # all ranks use rank 0's confidences.
+        get_tp_group().broadcast(confidences, src=0)
+        self._confidence_probs[input_batch.idx_mapping] = confidences
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
 
